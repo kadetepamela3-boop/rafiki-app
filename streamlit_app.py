@@ -1231,6 +1231,10 @@ def build_system_prompt(tier: str, language: str) -> str:
         "Always mention the source institution naturally if it is relevant "
         "(e.g. 'According to CRDB...' / 'Kulingana na CRDB...').\n"
         "If the user message is unclear, politely ask them to clarify.\n"
+        "You can add supporting information from the context, but do not hallucinate or make up answers.\n"
+        "Answer the question even if it's not in the context but somehow related to the other contexts, but do not make up wrong answers.\n"
+        "Do not say you don't know if the answer is in the context, instead say you don't have verified information, and also give the user some ideas on the question asked even if you don't know.\n"
+        "if the question asked is relating to the one in the dataset context, answer the question using the context and also give the user some ideas on the question asked even if you don't know.\n"
         "Keep answers clear, accurate, and appropriately concise for the user's tier."
     )
 
