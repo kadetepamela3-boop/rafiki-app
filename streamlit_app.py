@@ -1408,6 +1408,13 @@ def generate_answer(query: str, tier: str, language: str, history: list):
     contexts = retrieve(query, tier, language, k=TOP_K)
     passed = bool(contexts and contexts[0]["distance"] <= NO_MATCH_THRESHOLD)
 
+    debug_info = {
+        "mode": "dataset" if passed else "checking...",
+        "distance": round(contexts[0]["distance"], 2) if contexts else None,
+        "matched_question": contexts[0]["question"] if contexts else None,
+        "threshold": NO_MATCH_THRESHOLD,
+    }
+
     # Dataset had no confident match -> fall back to a live web search.
     # This only runs for out-of-dataset questions, so normal questions never
     # pay the network cost, and identical repeat questions hit the cache.
@@ -1418,6 +1425,11 @@ def generate_answer(query: str, tier: str, language: str, history: list):
             contexts = live_contexts
             passed = True
             live_mode = True
+            debug_info["mode"] = "live_search"
+        else:
+            debug_info["mode"] = "no_match"
+
+    st.session_state["_last_debug"] = debug_info
 
     if not passed:
         return NO_MATCH_MESSAGE[language]
@@ -1725,6 +1737,17 @@ if st.session_state.get("awaiting_answer"):
     with st.spinner(spinner):
         answer = generate_answer(user_query, tier, language, st.session_state.messages)
     render_chat_bubble("assistant", answer)
+
+    # Add "?debug=1" to the app's URL to see exactly which path each answer
+    # took (dataset match + distance / live search / no match) -- useful for
+    # tuning NO_MATCH_THRESHOLD without redeploying.
+    if st.query_params.get("debug") == "1":
+        dbg = st.session_state.get("_last_debug", {})
+        st.caption(
+            f"🔧 debug — mode: {dbg.get('mode')} | "
+            f"top distance: {dbg.get('distance')} (threshold: {dbg.get('threshold')}) | "
+            f"closest dataset match: \"{dbg.get('matched_question')}\""
+        )
 
     st.session_state.display_messages.append({"role": "assistant", "content": answer})
     st.session_state.messages.append({"role": "assistant", "content": answer})
