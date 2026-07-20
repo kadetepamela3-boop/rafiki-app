@@ -95,7 +95,7 @@ EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 TOP_K = 3
 # L2 distances for good matches with this model are typically ~9–32 (see retrieval tests).
-NO_MATCH_THRESHOLD = 32
+NO_MATCH_THRESHOLD = 20
 
 # ---------------------------------------------------------------------------
 # 1b. LIVE SEARCH CONFIG
