@@ -82,7 +82,7 @@ if not GROQ_API_KEY:
     )
     st.stop()
 
-DATA_PATH = os.environ.get("SM01_DATA_PATH", "faq_qns22_csv.csv")
+DATA_PATH = os.environ.get("SM01_DATA_PATH", "qns.csv.csv")
 EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 TOP_K = 3
