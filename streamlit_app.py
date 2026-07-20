@@ -23,6 +23,14 @@ from groq import APIError, RateLimitError
 from sentence_transformers import SentenceTransformer
 from groq.types.chat import ChatCompletionMessageParam
 
+# Live web search (DuckDuckGo). Guarded import so the app still runs even if
+# the package isn't installed yet -- live search just quietly disables itself.
+try:
+    from ddgs import DDGS  # pip install ddgs
+    LIVE_SEARCH_AVAILABLE = True
+except ImportError:
+    LIVE_SEARCH_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # 1. CONFIG
 # ---------------------------------------------------------------------------
@@ -82,12 +90,58 @@ if not GROQ_API_KEY:
     )
     st.stop()
 
-DATA_PATH = os.environ.get("SM01_DATA_PATH", "qns.csv.csv")
+DATA_PATH = os.environ.get("SM01_DATA_PATH", "faq_qns22_csv.csv")
 EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 TOP_K = 3
 # L2 distances for good matches with this model are typically ~9–32 (see retrieval tests).
 NO_MATCH_THRESHOLD = 32
+
+# ---------------------------------------------------------------------------
+# 1b. LIVE SEARCH CONFIG
+# ---------------------------------------------------------------------------
+# Live search only fires when local FAISS retrieval has NO confident match
+# (distance > NO_MATCH_THRESHOLD), so ordinary in-dataset questions never
+# touch the network and stay fast. Results are cached per (query, language),
+# so the exact same question is never searched twice.
+ENABLE_LIVE_SEARCH = True
+LIVE_SEARCH_MAX_RESULTS = 3        # keep small = keep it fast
+LIVE_SEARCH_TIMEOUT = 6            # seconds, per search attempt
+LIVE_SEARCH_CACHE_TTL = 60 * 60 * 6  # 6 hours before a repeat question re-searches
+
+# Official/verified Tanzanian sources are ranked to the top of live results.
+# NOTE ON SCRAPING: this feature reads DuckDuckGo's public search-result
+# snippets only -- it does not crawl these institutions' pages directly, so
+# their individual robots.txt rules don't apply to it. If you later add a
+# feature that fetches full pages from a specific site, check that site's
+# /robots.txt first (you've confirmed CRDB and TRA currently allow it).
+TRUSTED_TZ_SOURCES = [
+    "crdbbank.co.tz", "nmbbank.co.tz", "tra.go.tz", "bot.go.tz",
+    "tcra.go.tz", "nssf.go.tz", "nhif.go.tz", "brela.go.tz", "boi.go.tz",
+]
+
+LIVE_SEARCH_SYSTEM_NOTE = {
+    "English": (
+        "The context above was pulled from a live web search just now, not "
+        "from your curated knowledge base. Treat it as unverified: answer "
+        "helpfully, but make clear the user should confirm it with the "
+        "official institution before acting on it."
+    ),
+    "Swahili": (
+        "Muktadha ulio juu umetolewa kwa utafutaji wa moja kwa moja "
+        "mtandaoni sasa hivi, si kwenye hifadhi yako ya maarifa iliyopangwa. "
+        "Uzingatie kama taarifa isiyothibitishwa kikamilifu: jibu kwa "
+        "msaada, lakini mweleze mtumiaji athibitishe na taasisi rasmi kabla "
+        "ya kutumia taarifa hiyo."
+    ),
+}
+
+LIVE_SEARCH_BADGE = {
+    "English": "\n\n*🔎 Live web result — please verify with the official source.*",
+    "Swahili": "\n\n*🔎 Jibu la utafutaji wa moja kwa moja — tafadhali thibitisha na chanzo rasmi.*",
+}
+
+LEARNED_FAQ_PATH = os.environ.get("SM01_LEARNED_PATH", "live_learned_faqs.csv")
 
 TIERS = ["Machinga", "Micro", "SME Owner", "Employee", "Corporate"]
 LANGUAGES = ["English", "Swahili"]
@@ -1211,6 +1265,109 @@ def retrieve(query: str, tier: str, language: str, k: int = TOP_K):
 
 
 # ---------------------------------------------------------------------------
+# 3b. LIVE WEB SEARCH (fallback only — dataset stays the first source of truth)
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=LIVE_SEARCH_CACHE_TTL, show_spinner=False)
+def _cached_live_search(query: str, language: str) -> list[dict]:
+    """Runs one lightweight DuckDuckGo text search and shapes the results to
+    look like `retrieve()` output so the rest of the pipeline doesn't care
+    where the context came from. Cached (query, language) -> same question
+    never triggers a second real search within the TTL window."""
+    search_query = f"{query} Tanzania"
+    try:
+        with DDGS(timeout=LIVE_SEARCH_TIMEOUT) as ddgs:
+            raw_results = list(ddgs.text(
+                search_query,
+                region="us-en",
+                safesearch="moderate",
+                max_results=LIVE_SEARCH_MAX_RESULTS,
+                backend="auto",
+            ))
+    except Exception:
+        return []  # network issue, rate limit, etc. -- fail quietly
+
+    def _priority(r: dict) -> int:
+        href = (r.get("href") or "").lower()
+        return 0 if any(d in href for d in TRUSTED_TZ_SOURCES) else 1
+
+    raw_results.sort(key=_priority)
+
+    shaped = []
+    for r in raw_results[:LIVE_SEARCH_MAX_RESULTS]:
+        title = (r.get("title") or "").strip()
+        snippet = (r.get("body") or "").strip()
+        href = r.get("href") or ""
+        if not snippet:
+            continue
+        domain = href.split("//")[-1].split("/")[0].replace("www.", "") or "Web search"
+        shaped.append({
+            "distance": 0.0,
+            "question": query,
+            "answer_context": f"{title}. {snippet}"[:600],
+            "topic": "Live web result",
+            "source": domain,
+            "url": href,
+        })
+    return shaped
+
+
+def live_web_search(query: str, language: str) -> list[dict]:
+    """Public entry point used by generate_answer(). Safe to call even if
+    ddgs isn't installed or the network call fails -- always returns a list."""
+    if not (ENABLE_LIVE_SEARCH and LIVE_SEARCH_AVAILABLE):
+        return []
+    try:
+        return _cached_live_search(query.strip().lower(), language)
+    except Exception:
+        return []
+
+
+def _learn_new_faq(query: str, answer: str, tier: str, language: str, live_contexts: list) -> None:
+    """Self-updating dataset: folds a freshly live-searched Q&A straight into
+    the in-memory FAISS index for this (tier, language), so a repeat of the
+    same -- or a very similar -- question is answered instantly next time,
+    without another live search. Also appends it to a small CSV so it can
+    survive an app restart (best-effort; some free hosts reset disk on
+    redeploy, so treat this as a bonus, not guaranteed long-term storage)."""
+    try:
+        source_label = ", ".join(sorted({c["source"] for c in live_contexts})) or "Web search"
+        new_row = {
+            "pair_id": f"LIVE_{abs(hash(query)) % 10**8}",
+            "user_tier": tier,
+            "language": language,
+            "topic": "Live web result",
+            "source": source_label,
+            "keywords": "",
+            "question": query,
+            "answer": answer[:300],
+            "answer_context": answer,
+        }
+
+        embed_text = f"{query} {answer[:400]}"
+        new_emb = np.array(embed_model.encode([embed_text])).astype("float32")
+
+        key = (tier, language)
+        if key in indexes:
+            idx, group = indexes[key]
+            idx.add(new_emb)
+            indexes[key] = (idx, pd.concat([group, pd.DataFrame([new_row])], ignore_index=True))
+        else:
+            new_idx = faiss.IndexFlatL2(new_emb.shape[1])
+            new_idx.add(new_emb)
+            indexes[key] = (new_idx, pd.DataFrame([new_row]))
+
+        pd.DataFrame([new_row]).to_csv(
+            LEARNED_FAQ_PATH,
+            mode="a",
+            header=not os.path.exists(LEARNED_FAQ_PATH),
+            index=False,
+        )
+    except Exception:
+        pass  # self-learning is a bonus -- never let it break the chat
+
+
+# ---------------------------------------------------------------------------
 # 4. PROMPT CONSTRUCTION + GENERATION
 # ---------------------------------------------------------------------------
 
@@ -1233,6 +1390,7 @@ def build_system_prompt(tier: str, language: str) -> str:
         "If the user message is unclear, politely ask them to clarify.\n"
         "You can add supporting information from the context, but do not hallucinate or make up answers.\n"
         "Answer the question even if it's not in the context but somehow related to the other contexts, but do not make up wrong answers.\n"
+        "Do not say you don't know if the answer is in the context, instead say you don't have verified information, and also give the user some ideas on the question asked even if you don't know.\n"
         "if the question asked is relating to the one in the dataset context, answer the question using the context and also give the user some ideas on the question asked even if you don't know.\n"
         "Keep answers clear, accurate, and appropriately concise for the user's tier."
     )
@@ -1250,10 +1408,23 @@ def generate_answer(query: str, tier: str, language: str, history: list):
     contexts = retrieve(query, tier, language, k=TOP_K)
     passed = bool(contexts and contexts[0]["distance"] <= NO_MATCH_THRESHOLD)
 
+    # Dataset had no confident match -> fall back to a live web search.
+    # This only runs for out-of-dataset questions, so normal questions never
+    # pay the network cost, and identical repeat questions hit the cache.
+    live_mode = False
+    if not passed:
+        live_contexts = live_web_search(query, language)
+        if live_contexts:
+            contexts = live_contexts
+            passed = True
+            live_mode = True
+
     if not passed:
         return NO_MATCH_MESSAGE[language]
 
     system_prompt = build_system_prompt(tier, language)
+    if live_mode:
+        system_prompt += "\n\n" + LIVE_SEARCH_SYSTEM_NOTE[language]
     user_prompt = build_user_prompt(query, contexts)
 
     messages: list[ChatCompletionMessageParam] = [{"role": "system", "content": system_prompt}]
@@ -1267,7 +1438,13 @@ def generate_answer(query: str, tier: str, language: str, history: list):
             messages=messages,
             temperature=0.3,
         )
-        return response.choices[0].message.content or NO_MATCH_MESSAGE[language]
+        answer = response.choices[0].message.content or NO_MATCH_MESSAGE[language]
+
+        if live_mode and answer != NO_MATCH_MESSAGE[language]:
+            _learn_new_faq(query, answer, tier, language, contexts)
+            answer += LIVE_SEARCH_BADGE[language]
+
+        return answer
     except RateLimitError:
         return (
             "The service is busy right now. Please wait a moment and try again."
