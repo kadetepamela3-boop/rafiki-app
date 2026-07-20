@@ -94,8 +94,21 @@ DATA_PATH = os.environ.get("SM01_DATA_PATH", "faq_qns22_csv.csv")
 EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 TOP_K = 3
-# L2 distances for good matches with this model are typically ~9–32 (see retrieval tests).
+# L2 distances for good matches with this model are typically ~9–32, but real
+# matches cluster at the lower end of that range -- 30+ is often a loosely
+# related, wrong-topic hit (confirmed via ?debug=1 testing on 2026-07-20).
 NO_MATCH_THRESHOLD = 20
+# Looser threshold used ONLY when the query shares a meaningful word with the
+# closest dataset question (see _shares_keyword). This catches real dataset
+# matches that are phrased very differently from a short user query (e.g.
+# "What is transfer pricing?" vs a longer statutory-requirements question),
+# without loosening the strict threshold for genuinely unrelated topics.
+NO_MATCH_THRESHOLD_WITH_OVERLAP = 32
+STOPWORDS = {
+    "what", "is", "are", "the", "a", "an", "of", "to", "for", "in", "on",
+    "and", "or", "how", "do", "does", "i", "my", "can", "with", "about",
+    "je", "ni", "na", "kwa", "ya", "wa", "za", "gani", "nini", "kama",
+}
 
 # ---------------------------------------------------------------------------
 # 1b. LIVE SEARCH CONFIG
@@ -134,11 +147,6 @@ LIVE_SEARCH_SYSTEM_NOTE = {
         "msaada, lakini mweleze mtumiaji athibitishe na taasisi rasmi kabla "
         "ya kutumia taarifa hiyo."
     ),
-}
-
-LIVE_SEARCH_BADGE = {
-    "English": "\n\n*🔎 Live web result — please verify with the official source.*",
-    "Swahili": "\n\n*🔎 Jibu la utafutaji wa moja kwa moja — tafadhali thibitisha na chanzo rasmi.*",
 }
 
 LEARNED_FAQ_PATH = os.environ.get("SM01_LEARNED_PATH", "live_learned_faqs.csv")
@@ -1367,6 +1375,16 @@ def _learn_new_faq(query: str, answer: str, tier: str, language: str, live_conte
         pass  # self-learning is a bonus -- never let it break the chat
 
 
+def _shares_keyword(query: str, candidate_text: str) -> bool:
+    """True if the query and a candidate dataset question share at least one
+    meaningful word (4+ letters, stopwords excluded). Used to allow a looser
+    distance threshold for real topic matches phrased very differently from
+    the user's short question."""
+    q_words = {w for w in re.findall(r"[a-zA-Z]{4,}", query.lower()) if w not in STOPWORDS}
+    c_words = {w for w in re.findall(r"[a-zA-Z]{4,}", candidate_text.lower()) if w not in STOPWORDS}
+    return bool(q_words & c_words)
+
+
 # ---------------------------------------------------------------------------
 # 4. PROMPT CONSTRUCTION + GENERATION
 # ---------------------------------------------------------------------------
@@ -1406,13 +1424,18 @@ def build_user_prompt(query: str, contexts: list) -> str:
 
 def generate_answer(query: str, tier: str, language: str, history: list):
     contexts = retrieve(query, tier, language, k=TOP_K)
-    passed = bool(contexts and contexts[0]["distance"] <= NO_MATCH_THRESHOLD)
+    top = contexts[0] if contexts else None
+
+    effective_threshold = NO_MATCH_THRESHOLD
+    if top and _shares_keyword(query, top["question"]):
+        effective_threshold = NO_MATCH_THRESHOLD_WITH_OVERLAP
+    passed = bool(top and top["distance"] <= effective_threshold)
 
     debug_info = {
         "mode": "dataset" if passed else "checking...",
-        "distance": round(contexts[0]["distance"], 2) if contexts else None,
-        "matched_question": contexts[0]["question"] if contexts else None,
-        "threshold": NO_MATCH_THRESHOLD,
+        "distance": round(top["distance"], 2) if top else None,
+        "matched_question": top["question"] if top else None,
+        "threshold": effective_threshold,
     }
 
     # Dataset had no confident match -> fall back to a live web search.
@@ -1454,7 +1477,6 @@ def generate_answer(query: str, tier: str, language: str, history: list):
 
         if live_mode and answer != NO_MATCH_MESSAGE[language]:
             _learn_new_faq(query, answer, tier, language, contexts)
-            answer += LIVE_SEARCH_BADGE[language]
 
         return answer
     except RateLimitError:
