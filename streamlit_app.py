@@ -1633,6 +1633,19 @@ with st.sidebar:
     with profile_card_slot.container():
         render_sidebar_profile_card(tier, language)
 
+    # Streamlit Cloud's disk is ephemeral (wiped on redeploy/sleep), so this
+    # lets you grab the questions learned from live search while the app is
+    # awake, to merge into tz_financial_faq_v2.csv yourself when you want.
+    if os.path.exists(LEARNED_FAQ_PATH):
+        with open(LEARNED_FAQ_PATH, "rb") as f:
+            st.download_button(
+                "⬇️ Download live-learned FAQs",
+                data=f.read(),
+                file_name="live_learned_faqs.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
 # --- Main chat panel ---
 lang_code = "EN" if language == "English" else "SW"
 st.markdown(
