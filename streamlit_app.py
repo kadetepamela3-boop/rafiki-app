@@ -1375,6 +1375,23 @@ def _learn_new_faq(query: str, answer: str, tier: str, language: str, live_conte
         pass  # self-learning is a bonus -- never let it break the chat
 
 
+TIME_SENSITIVE_PATTERNS = [
+    r"\btoday\b", r"\bcurrent(ly)?\b", r"\bnow\b", r"\blatest\b",
+    r"\bthis week\b", r"\bthis month\b", r"\breal[- ]?time\b",
+    r"\bexchange rate\b", r"\binterest rate\b", r"\bstock price\b",
+    r"\bleo\b", r"\bsasa\b", r"\bkiwango(.*leo)?\b",
+]
+
+
+def _is_time_sensitive(query: str) -> bool:
+    """True for questions about live/right-now data (exchange rates, prices,
+    'today', 'current', etc.) that a static dataset can never answer
+    correctly -- these should always attempt a fresh live search rather than
+    trusting a stale dataset match."""
+    q = query.lower()
+    return any(re.search(p, q) for p in TIME_SENSITIVE_PATTERNS)
+
+
 def _shares_keyword(query: str, candidate_text: str) -> bool:
     """True if the query and a candidate dataset question share at least one
     meaningful word (4+ letters, stopwords excluded). Used to allow a looser
@@ -1429,29 +1446,30 @@ def generate_answer(query: str, tier: str, language: str, history: list):
     effective_threshold = NO_MATCH_THRESHOLD
     if top and _shares_keyword(query, top["question"]):
         effective_threshold = NO_MATCH_THRESHOLD_WITH_OVERLAP
-    passed = bool(top and top["distance"] <= effective_threshold)
+    dataset_passed = bool(top and top["distance"] <= effective_threshold)
 
-    debug_info = {
-        "mode": "dataset" if passed else "checking...",
-        "distance": round(top["distance"], 2) if top else None,
-        "matched_question": top["question"] if top else None,
-        "threshold": effective_threshold,
-    }
+    # Time-sensitive questions (exchange rates, "current"/"today" prices,
+    # etc.) can never be answered correctly from a static dataset, so try a
+    # live search first even when the dataset technically "matches" --
+    # falling back to the dataset's generic guidance only if live search
+    # itself comes back empty (e.g. network unavailable).
+    needs_live = _is_time_sensitive(query) or not dataset_passed
 
-    # Dataset had no confident match -> fall back to a live web search.
-    # This only runs for out-of-dataset questions, so normal questions never
-    # pay the network cost, and identical repeat questions hit the cache.
+    passed = dataset_passed
     live_mode = False
-    if not passed:
+    if needs_live:
         live_contexts = live_web_search(query, language)
         if live_contexts:
             contexts = live_contexts
             passed = True
             live_mode = True
-            debug_info["mode"] = "live_search"
-        else:
-            debug_info["mode"] = "no_match"
 
+    debug_info = {
+        "mode": "live_search" if live_mode else ("dataset" if passed else "no_match"),
+        "distance": round(top["distance"], 2) if top else None,
+        "matched_question": top["question"] if top else None,
+        "threshold": effective_threshold,
+    }
     st.session_state["_last_debug"] = debug_info
 
     if not passed:
@@ -1759,17 +1777,6 @@ if st.session_state.get("awaiting_answer"):
     with st.spinner(spinner):
         answer = generate_answer(user_query, tier, language, st.session_state.messages)
     render_chat_bubble("assistant", answer)
-
-    # Add "?debug=1" to the app's URL to see exactly which path each answer
-    # took (dataset match + distance / live search / no match) -- useful for
-    # tuning NO_MATCH_THRESHOLD without redeploying.
-    if st.query_params.get("debug") == "1":
-        dbg = st.session_state.get("_last_debug", {})
-        st.caption(
-            f"🔧 debug — mode: {dbg.get('mode')} | "
-            f"top distance: {dbg.get('distance')} (threshold: {dbg.get('threshold')}) | "
-            f"closest dataset match: \"{dbg.get('matched_question')}\""
-        )
 
     st.session_state.display_messages.append({"role": "assistant", "content": answer})
     st.session_state.messages.append({"role": "assistant", "content": answer})
